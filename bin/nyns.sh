@@ -22,6 +22,8 @@ interpret_command() {
         rm -rf ${arg1}
     elif [ "$command_type" = "moveto" ]; then
         cd -- "${arg1}"
+    elif [ "$command_type" = "import " ]; then
+        ./{$arg1}
     elif [ "$command_type" = "help" ]; then
         echo "echo: Displays text on-screen"
         echo "+: Addition"
@@ -33,6 +35,7 @@ interpret_command() {
         echo "ip: Get IP address"
         echo "create: Create a file"
         echo "adm: Run a command as admin"
+        echo "import: Import a script"
     elif [ "$command_type" = "ip" ]; then
         ip addr
     elif [ "$command_type" = "create" ]; then
