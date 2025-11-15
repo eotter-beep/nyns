@@ -9,6 +9,7 @@
 #include <string>
 
 #include <cerrno>
+#include <cstdint>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -96,6 +97,54 @@ static void print_ip_addresses() {
     }
 
     freeifaddrs(ifaddr);
+}
+
+static void print_mbr_partitions(const std::string &device) {
+    std::ifstream dev(device, std::ios::binary);
+    if (!dev) {
+        std::cerr << "Error: cannot open device '" << device << "'\n";
+        return;
+    }
+
+    unsigned char sector[512];
+    dev.read(reinterpret_cast<char *>(sector), sizeof(sector));
+    if (dev.gcount() != static_cast<std::streamsize>(sizeof(sector))) {
+        std::cerr << "Error: could not read MBR from '" << device << "'\n";
+        return;
+    }
+
+    if (sector[510] != 0x55 || sector[511] != 0xAA) {
+        std::cerr << "Warning: '" << device << "' does not appear to have a valid MBR signature\n";
+    }
+
+    struct PartitionEntry {
+        std::uint8_t boot_indicator;
+        std::uint8_t start_chs[3];
+        std::uint8_t partition_type;
+        std::uint8_t end_chs[3];
+        std::uint32_t start_lba;
+        std::uint32_t size_sectors;
+    } __attribute__((packed));
+
+    const std::size_t mbr_part_table_offset = 446;
+    const std::size_t max_partitions = 4;
+
+    for (std::size_t i = 0; i < max_partitions; ++i) {
+        auto *entry = reinterpret_cast<const PartitionEntry *>(
+            sector + mbr_part_table_offset + i * sizeof(PartitionEntry));
+
+        if (entry->partition_type == 0 || entry->size_sectors == 0) {
+            continue;
+        }
+
+        std::cout << "Partition " << (i + 1) << ": "
+                  << "boot=" << (entry->boot_indicator == 0x80 ? "yes" : "no")
+                  << ", type=0x" << std::hex << static_cast<int>(entry->partition_type)
+                  << std::dec
+                  << ", start_lba=" << entry->start_lba
+                  << ", sectors=" << entry->size_sectors
+                  << '\n';
+    }
 }
 
 static void interpret_command(const std::string &line);
@@ -198,8 +247,8 @@ static void interpret_command(const std::string &line) {
         std::cout << "ip: Get IP address information\n";
         std::cout << "create: Create a file\n";
         std::cout << "import: Import a script\n";
-        std::cout << "adm: Run a command as admin (not supported)\n";
-        std::cout << "partition: Partition a device (not supported)\n";
+        std::cout << "adm: Run a command as admin (requires root)\n";
+        std::cout << "partition: Show MBR partitions on a device\n";
     } else if (command_type == "ip") {
         print_ip_addresses();
     } else if (command_type == "create") {
@@ -231,7 +280,11 @@ static void interpret_command(const std::string &line) {
             std::perror("Error running admin command");
         }
     } else if (command_type == "partition") {
-        std::cerr << "Error: 'partition' is not supported in this build (no fdisk dependency)\n";
+        if (arg1.empty()) {
+            std::cerr << "Error: 'partition' requires a device or image path\n";
+            return;
+        }
+        print_mbr_partitions(arg1);
     } else {
         std::cerr << "Error: Unknown command '" << command_type << "'\n";
     }
