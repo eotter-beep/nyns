@@ -218,7 +218,18 @@ static void interpret_command(const std::string &line) {
         }
         run_script(arg1);
     } else if (command_type == "adm") {
-        std::cerr << "Error: 'adm' is not supported in this build (no sudo dependency)\n";
+        if (arg1.empty()) {
+            std::cerr << "Error: 'adm' requires a command\n";
+            return;
+        }
+        if (geteuid() != 0) {
+            std::cerr << "Error: 'adm' requires root privileges (run nyns as root)\n";
+            return;
+        }
+        int rc = std::system(arg1.c_str());
+        if (rc == -1) {
+            std::perror("Error running admin command");
+        }
     } else if (command_type == "partition") {
         std::cerr << "Error: 'partition' is not supported in this build (no fdisk dependency)\n";
     } else {
