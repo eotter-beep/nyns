@@ -7,6 +7,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <cerrno>
 #include <cstdint>
@@ -116,6 +117,37 @@ struct PartitionEntry {
 
 static constexpr std::size_t MBR_PART_TABLE_OFFSET = 446;
 static constexpr std::size_t MBR_MAX_PARTITIONS = 4;
+
+// Simple in-memory representation of a TUI menu consisting of buttons
+// and a display text area.
+static std::vector<std::string> g_buttons;
+static int g_selected_button = -1;
+static std::string g_display_text;
+
+static void draw_tui_menu() {
+    // Clear screen and move cursor to top-left for a full-screen effect
+    std::cout << "\033[2J\033[H";
+
+    std::cout << "==== DISPLAY ====\n";
+    if (!g_display_text.empty()) {
+        std::cout << g_display_text << '\n';
+    } else {
+        std::cout << "(no display text)\n";
+    }
+    std::cout << "=================\n\n";
+
+    std::cout << "==== MENU ====\n";
+    if (g_buttons.empty()) {
+        std::cout << "(no buttons)\n";
+    } else {
+        for (std::size_t i = 0; i < g_buttons.size(); ++i) {
+            bool selected = (static_cast<int>(i) == g_selected_button);
+            const char *marker = selected ? "> " : "  ";
+            std::cout << marker << (i + 1) << ") [" << g_buttons[i] << "]\n";
+        }
+    }
+    std::cout << "==============\n";
+}
 
 static void print_ip_addresses() {
     struct ifaddrs *ifaddr = nullptr;
@@ -389,17 +421,35 @@ static void interpret_command(const std::string &line) {
     iss >> arg1;
     iss >> arg2;
 
+    // Capture the remaining text on the line (if any), typically used for
+    // commands that need more than two arguments, like button labels or
+    // display text.
+    std::string rest_of_line;
+    std::getline(iss, rest_of_line);
+    if (!rest_of_line.empty()) {
+        // Trim leading spaces from the leftover text.
+        std::size_t first_non_space = rest_of_line.find_first_not_of(' ');
+        if (first_non_space != std::string::npos) {
+            rest_of_line.erase(0, first_non_space);
+        } else {
+            rest_of_line.clear();
+        }
+    }
+
     if (command_type == "echo") {
+        std::string text;
         if (!arg1.empty()) {
-            std::cout << arg1;
+            text += arg1;
         }
         if (!arg2.empty()) {
-            if (!arg1.empty()) {
-                std::cout << ' ';
+            if (!text.empty()) {
+                text += ' ';
             }
-            std::cout << arg2;
+            text += arg2;
         }
-        std::cout << '\n';
+        g_display_text = text;
+        std::cout << text << '\n';
+        draw_tui_menu();
     } else if (command_type == "+") {
         try {
             long long a = std::stoll(arg1);
@@ -457,6 +507,12 @@ static void interpret_command(const std::string &line) {
         std::cout << "adm: Run a command as admin (requires root)\n";
         std::cout << "partition: Show or modify MBR on a disk image\n";
         std::cout << "           Usage: partition <image> [clean|add|create]\n";
+        std::cout << "button: TUI buttons and selection\n";
+        std::cout << "        button add -text <label>\n";
+        std::cout << "        button select <index>\n";
+        std::cout << "        button next / button prev\n";
+        std::cout << "display: Change TUI display text\n";
+        std::cout << "         display -change <text>\n";
     } else if (command_type == "ip") {
         print_ip_addresses();
     } else if (command_type == "create") {
@@ -486,6 +542,83 @@ static void interpret_command(const std::string &line) {
         int rc = std::system(arg1.c_str());
         if (rc == -1) {
             std::perror("Error running admin command");
+        }
+    } else if (command_type == "button") {
+        if (arg1 == "add" && arg2 == "-text") {
+            if (rest_of_line.empty()) {
+                std::cerr << "Error: 'button add -text' requires a label\n";
+                return;
+            }
+            g_buttons.push_back(rest_of_line);
+            if (g_selected_button < 0) {
+                g_selected_button = 0;
+            }
+            draw_tui_menu();
+        } else if (arg1 == "select") {
+            if (arg2.empty()) {
+                std::cerr << "Error: 'button select' requires an index\n";
+                return;
+            }
+            if (g_buttons.empty()) {
+                std::cerr << "Error: no buttons to select\n";
+                return;
+            }
+            try {
+                int idx = std::stoi(arg2);
+                if (idx < 1 || idx > static_cast<int>(g_buttons.size())) {
+                    std::cerr << "Error: button index out of range\n";
+                    return;
+                }
+                g_selected_button = idx - 1;
+                draw_tui_menu();
+            } catch (...) {
+                std::cerr << "Error: invalid index for 'button select'\n";
+            }
+        } else if (arg1 == "next") {
+            if (g_buttons.empty()) {
+                std::cerr << "Error: no buttons to navigate\n";
+                return;
+            }
+            if (g_selected_button < 0 ||
+                g_selected_button >= static_cast<int>(g_buttons.size())) {
+                g_selected_button = 0;
+            } else {
+                g_selected_button =
+                    (g_selected_button + 1) % static_cast<int>(g_buttons.size());
+            }
+            draw_tui_menu();
+        } else if (arg1 == "prev") {
+            if (g_buttons.empty()) {
+                std::cerr << "Error: no buttons to navigate\n";
+                return;
+            }
+            if (g_selected_button < 0 ||
+                g_selected_button >= static_cast<int>(g_buttons.size())) {
+                g_selected_button = 0;
+            } else {
+                g_selected_button =
+                    (g_selected_button - 1 + static_cast<int>(g_buttons.size())) %
+                    static_cast<int>(g_buttons.size());
+            }
+            draw_tui_menu();
+        } else {
+            std::cerr << "Error: unknown 'button' usage. Expected one of:\n";
+            std::cerr << "  button add -text <label>\n";
+            std::cerr << "  button select <index>\n";
+            std::cerr << "  button next\n";
+            std::cerr << "  button prev\n";
+        }
+    } else if (command_type == "display") {
+        if (arg1 == "-change") {
+            std::string new_text = !rest_of_line.empty() ? rest_of_line : arg2;
+            if (new_text.empty()) {
+                std::cerr << "Error: 'display -change' requires text\n";
+                return;
+            }
+            g_display_text = new_text;
+            draw_tui_menu();
+        } else {
+            std::cerr << "Error: unknown 'display' usage. Expected: display -change <text>\n";
         }
     } else if (command_type == "partition") {
         if (arg1.empty()) {
