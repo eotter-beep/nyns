@@ -69,6 +69,34 @@ static bool remove_recursive(const std::string &path, bool force = false) {
     return true;
 }
 
+static bool mkdir_p(const std::string &path) {
+    if (path.empty() || path == ".") {
+        return true;
+    }
+    if (path == "/") {
+        return true;
+    }
+
+    struct stat st{};
+    if (stat(path.c_str(), &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+
+    std::size_t pos = path.rfind('/');
+    if (pos != std::string::npos && pos > 0) {
+        std::string parent = path.substr(0, pos);
+        if (!mkdir_p(parent)) {
+            return false;
+        }
+    }
+
+    if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
+        std::perror(("Error creating directory '" + path + "'").c_str());
+        return false;
+    }
+    return true;
+}
+
 static bool is_block_device(const std::string &path) {
     struct stat st{};
     if (stat(path.c_str(), &st) != 0) {
@@ -264,6 +292,68 @@ static bool add_single_partition(const std::string &device) {
     return true;
 }
 
+static bool create_image_with_partition(const std::string &image) {
+    if (image.rfind("/dev/", 0) == 0 || is_block_device(image)) {
+        std::cerr << "Refusing to create image on real block device path '" << image
+                  << "'. Use a regular file path instead.\n";
+        return false;
+    }
+
+    struct stat st{};
+    if (stat(image.c_str(), &st) == 0) {
+        std::cerr << "Error: image '" << image << "' already exists\n";
+        return false;
+    }
+
+    std::size_t slash_pos = image.rfind('/');
+    if (slash_pos != std::string::npos && slash_pos > 0) {
+        std::string parent = image.substr(0, slash_pos);
+        if (!mkdir_p(parent)) {
+            return false;
+        }
+    }
+
+    constexpr std::uint32_t sectors = 1024; // 512 KiB image
+    constexpr std::uint64_t image_size = static_cast<std::uint64_t>(sectors) * 512u;
+
+    std::fstream dev(image, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!dev) {
+        std::cerr << "Error: cannot create image '" << image << "'\n";
+        return false;
+    }
+
+    unsigned char sector[512];
+    std::memset(sector, 0, sizeof(sector));
+    sector[510] = 0x55;
+    sector[511] = 0xAA;
+
+    auto *entries = reinterpret_cast<PartitionEntry *>(sector + MBR_PART_TABLE_OFFSET);
+    std::memset(entries, 0, sizeof(PartitionEntry) * MBR_MAX_PARTITIONS);
+
+    PartitionEntry &p = entries[0];
+    p.boot_indicator = 0x00;
+    p.partition_type = 0x83; // Linux filesystem
+    p.start_lba = 1;
+    p.size_sectors = sectors - 1;
+
+    dev.write(reinterpret_cast<const char *>(sector), sizeof(sector));
+    if (!dev) {
+        std::cerr << "Error: failed to write MBR to new image '" << image << "'\n";
+        return false;
+    }
+
+    dev.seekp(static_cast<std::streamoff>(image_size) - 1);
+    char zero = 0;
+    dev.write(&zero, 1);
+    if (!dev) {
+        std::cerr << "Error: failed to resize image '" << image << "'\n";
+        return false;
+    }
+
+    dev.flush();
+    return true;
+}
+
 static void interpret_command(const std::string &line);
 
 static void run_script(const std::string &script_path) {
@@ -366,7 +456,7 @@ static void interpret_command(const std::string &line) {
         std::cout << "import: Import a script\n";
         std::cout << "adm: Run a command as admin (requires root)\n";
         std::cout << "partition: Show or modify MBR on a disk image\n";
-        std::cout << "           Usage: partition <image> [clean|add]\n";
+        std::cout << "           Usage: partition <image> [clean|add|create]\n";
     } else if (command_type == "ip") {
         print_ip_addresses();
     } else if (command_type == "create") {
@@ -409,6 +499,10 @@ static void interpret_command(const std::string &line) {
         } else if (arg2 == "add") {
             if (add_single_partition(arg1)) {
                 std::cout << "Single primary partition added on '" << arg1 << "'\n";
+            }
+        } else if (arg2 == "create") {
+            if (create_image_with_partition(arg1)) {
+                std::cout << "Disk image created with single primary partition at '" << arg1 << "'\n";
             }
         } else if (arg2.empty()) {
             print_mbr_partitions(arg1);
