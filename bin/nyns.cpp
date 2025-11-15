@@ -69,6 +69,26 @@ static bool remove_recursive(const std::string &path, bool force = false) {
     return true;
 }
 
+static bool is_block_device(const std::string &path) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0) {
+        return false;
+    }
+    return S_ISBLK(st.st_mode);
+}
+
+struct PartitionEntry {
+    std::uint8_t boot_indicator;
+    std::uint8_t start_chs[3];
+    std::uint8_t partition_type;
+    std::uint8_t end_chs[3];
+    std::uint32_t start_lba;
+    std::uint32_t size_sectors;
+} __attribute__((packed));
+
+static constexpr std::size_t MBR_PART_TABLE_OFFSET = 446;
+static constexpr std::size_t MBR_MAX_PARTITIONS = 4;
+
 static void print_ip_addresses() {
     struct ifaddrs *ifaddr = nullptr;
     if (getifaddrs(&ifaddr) == -1) {
@@ -117,21 +137,9 @@ static void print_mbr_partitions(const std::string &device) {
         std::cerr << "Warning: '" << device << "' does not appear to have a valid MBR signature\n";
     }
 
-    struct PartitionEntry {
-        std::uint8_t boot_indicator;
-        std::uint8_t start_chs[3];
-        std::uint8_t partition_type;
-        std::uint8_t end_chs[3];
-        std::uint32_t start_lba;
-        std::uint32_t size_sectors;
-    } __attribute__((packed));
-
-    const std::size_t mbr_part_table_offset = 446;
-    const std::size_t max_partitions = 4;
-
-    for (std::size_t i = 0; i < max_partitions; ++i) {
+    for (std::size_t i = 0; i < MBR_MAX_PARTITIONS; ++i) {
         auto *entry = reinterpret_cast<const PartitionEntry *>(
-            sector + mbr_part_table_offset + i * sizeof(PartitionEntry));
+            sector + MBR_PART_TABLE_OFFSET + i * sizeof(PartitionEntry));
 
         if (entry->partition_type == 0 || entry->size_sectors == 0) {
             continue;
@@ -145,6 +153,115 @@ static void print_mbr_partitions(const std::string &device) {
                   << ", sectors=" << entry->size_sectors
                   << '\n';
     }
+}
+
+static bool wipe_mbr_partition_table(const std::string &device) {
+    if (device.rfind("/dev/", 0) == 0 || is_block_device(device)) {
+        std::cerr << "Refusing to modify real block device '" << device
+                  << "'. Use a disk image file instead.\n";
+        return false;
+    }
+
+    std::fstream dev(device, std::ios::in | std::ios::out | std::ios::binary);
+    if (!dev) {
+        std::cerr << "Error: cannot open device/image '" << device << "' for writing\n";
+        return false;
+    }
+
+    unsigned char sector[512];
+    dev.read(reinterpret_cast<char *>(sector), sizeof(sector));
+    if (dev.gcount() != static_cast<std::streamsize>(sizeof(sector))) {
+        std::cerr << "Error: could not read MBR from '" << device << "'\n";
+        return false;
+    }
+
+    if (sector[510] != 0x55 || sector[511] != 0xAA) {
+        std::cerr << "Warning: '" << device
+                  << "' does not have a valid MBR signature; writing anyway\n";
+    }
+
+    std::memset(sector + 446, 0, 64);
+    dev.seekp(0);
+    dev.write(reinterpret_cast<const char *>(sector), sizeof(sector));
+    if (!dev) {
+        std::cerr << "Error: failed to write updated MBR to '" << device << "'\n";
+        return false;
+    }
+
+    dev.flush();
+    return true;
+}
+
+static bool add_single_partition(const std::string &device) {
+    if (device.rfind("/dev/", 0) == 0 || is_block_device(device)) {
+        std::cerr << "Refusing to modify real block device '" << device
+                  << "'. Use a disk image file instead.\n";
+        return false;
+    }
+
+    std::fstream dev(device, std::ios::in | std::ios::out | std::ios::binary);
+    if (!dev) {
+        std::cerr << "Error: cannot open device/image '" << device << "' for writing\n";
+        return false;
+    }
+
+    dev.seekg(0, std::ios::end);
+    std::streamoff file_size = dev.tellg();
+    if (file_size <= 0) {
+        std::cerr << "Error: could not determine size of '" << device << "'\n";
+        return false;
+    }
+    if (file_size < static_cast<std::streamoff>(512 * 2)) {
+        std::cerr << "Error: image '" << device << "' is too small for a partition table\n";
+        return false;
+    }
+
+    std::uint64_t total_sectors64 = static_cast<std::uint64_t>(file_size / 512);
+    if (total_sectors64 > 0xFFFFFFFFu) {
+        std::cerr << "Error: image '" << device << "' is too large for 32-bit LBA\n";
+        return false;
+    }
+    std::uint32_t total_sectors = static_cast<std::uint32_t>(total_sectors64);
+
+    dev.seekg(0);
+    unsigned char sector[512];
+    dev.read(reinterpret_cast<char *>(sector), sizeof(sector));
+    if (dev.gcount() != static_cast<std::streamsize>(sizeof(sector))) {
+        std::cerr << "Error: could not read MBR from '" << device << "'\n";
+        return false;
+    }
+
+    if (sector[510] != 0x55 || sector[511] != 0xAA) {
+        std::memset(sector, 0, sizeof(sector));
+        sector[510] = 0x55;
+        sector[511] = 0xAA;
+    }
+
+    auto *entries = reinterpret_cast<PartitionEntry *>(sector + MBR_PART_TABLE_OFFSET);
+    for (std::size_t i = 0; i < MBR_MAX_PARTITIONS; ++i) {
+        if (entries[i].partition_type != 0 && entries[i].size_sectors != 0) {
+            std::cerr << "Error: existing partition entries found on '" << device
+                      << "'. Use 'partition " << device << " clean' first.\n";
+            return false;
+        }
+    }
+
+    PartitionEntry &p = entries[0];
+    std::memset(&p, 0, sizeof(p));
+    p.boot_indicator = 0x00;
+    p.partition_type = 0x83; // Linux filesystem
+    p.start_lba = 1;
+    p.size_sectors = total_sectors - 1;
+
+    dev.seekp(0);
+    dev.write(reinterpret_cast<const char *>(sector), sizeof(sector));
+    if (!dev) {
+        std::cerr << "Error: failed to write updated MBR to '" << device << "'\n";
+        return false;
+    }
+
+    dev.flush();
+    return true;
 }
 
 static void interpret_command(const std::string &line);
@@ -248,7 +365,8 @@ static void interpret_command(const std::string &line) {
         std::cout << "create: Create a file\n";
         std::cout << "import: Import a script\n";
         std::cout << "adm: Run a command as admin (requires root)\n";
-        std::cout << "partition: Show MBR partitions on a device\n";
+        std::cout << "partition: Show or modify MBR on a disk image\n";
+        std::cout << "           Usage: partition <image> [clean|add]\n";
     } else if (command_type == "ip") {
         print_ip_addresses();
     } else if (command_type == "create") {
@@ -284,7 +402,20 @@ static void interpret_command(const std::string &line) {
             std::cerr << "Error: 'partition' requires a device or image path\n";
             return;
         }
-        print_mbr_partitions(arg1);
+        if (arg2 == "wipe" || arg2 == "clean") {
+            if (wipe_mbr_partition_table(arg1)) {
+                std::cout << "MBR partition table cleaned on '" << arg1 << "'\n";
+            }
+        } else if (arg2 == "add") {
+            if (add_single_partition(arg1)) {
+                std::cout << "Single primary partition added on '" << arg1 << "'\n";
+            }
+        } else if (arg2.empty()) {
+            print_mbr_partitions(arg1);
+        } else {
+            std::cerr << "Error: unknown partition action '" << arg2
+                      << "'. Use no action, 'clean', or 'add'.\n";
+        }
     } else {
         std::cerr << "Error: Unknown command '" << command_type << "'\n";
     }
